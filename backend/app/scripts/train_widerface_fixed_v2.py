@@ -1,0 +1,329 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from model.u2net import U2NET,U2NETP  # 确保已导入 U^2-Net 模型定义
+
+# ---------------------------
+# 1. 数据集路径配置
+# ---------------------------
+widerface_root = "/Users/shhaofu/.cache/kagglehub/datasets/iamprateek/wider-face-a-face-detection-dataset/versions/1"  # 数据集根目录
+train_image_dir = os.path.join(widerface_root, "WIDER_train/images")
+train_annot_file = os.path.join(widerface_root, "wider_face_annotations/wider_face_split/wider_face_train_bbx_gt.txt")
+val_image_dir = os.path.join(widerface_root, "WIDER_val/images")
+val_annot_file = os.path.join(widerface_root, "wider_face_annotations/wider_face_split/wider_face_val_bbx_gt.txt")
+
+# ---------------------------
+# 2. 自定义数据集类
+# ---------------------------
+class WiderFaceDataset(Dataset):
+    def __init__(self, image_dir, annot_file, img_size=512, is_train=True, sample_ratio=1.0):
+        self.image_dir = image_dir
+        self.img_size = img_size
+        self.sample_ratio = sample_ratio  # 添加采样比例参数，默认为1.0（使用全部数据）
+        self.annotations = self._parse_annotations(annot_file)
+        
+        # 数据增强
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]) if is_train else transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def _parse_annotations(self, annot_file):
+        """解析 WIDER FACE 标注文件
+        
+        WIDER FACE 标注文件格式：
+        图像文件名
+        人脸数量
+        x1 y1 w h blur expression illumination invalid occlusion pose
+        ...
+        (对每个人脸重复上面的行)
+        """
+        annotations = []
+        try:
+            with open(annot_file, 'r') as f:
+                lines = f.readlines()
+                idx = 0
+                image_count = 0  # 用于跟踪处理的图像数量
+                while idx < len(lines):
+                    # 获取图像文件名
+                    img_name = lines[idx].strip()
+                    idx += 1
+                    
+                    # 确保我们没有超出文件末尾
+                    if idx >= len(lines):
+                        break
+                    
+                    # 获取人脸数量
+                    try:
+                        num_faces = int(lines[idx].strip())
+                        idx += 1
+                    except ValueError:
+                        # 如果无法解析为整数，可能是另一个图像文件名
+                        # 回退一步，继续处理下一个图像
+                        print(f"警告：无法解析人脸数量，跳过图像 {img_name}")
+                        continue
+                    
+                    # 读取所有人脸边界框
+                    bboxes = []
+                    for _ in range(num_faces):
+                        if idx >= len(lines):
+                            break
+                        
+                        try:
+                            # 只取前4个值：x, y, w, h
+                            parts = lines[idx].strip().split()
+                            if len(parts) >= 4:  # 确保有足够的值
+                                bbox = list(map(int, parts[:4]))
+                                bboxes.append(bbox)  # [x1, y1, w, h]
+                        except ValueError:
+                            # 如果无法解析为整数，可能是下一个图像的文件名
+                            # 回退一步，让下一次循环处理它
+                            idx -= 1
+                            break
+                        
+                        idx += 1
+                    
+                    # 只有当至少有一个有效的边界框时才添加此图像
+                    if bboxes:
+                        # 根据采样比例决定是否保留此图像
+                        image_count += 1
+                        if image_count % int(1.0 / self.sample_ratio) == 0:  # 每 1/sample_ratio 个图像保留一个
+                            annotations.append((img_name, bboxes))
+            
+            total_images = image_count
+            sampled_images = len(annotations)
+            print(f"成功加载 {sampled_images}/{total_images} 个图像的标注 (采样比例: {self.sample_ratio:.2f})")
+            return annotations
+        except Exception as e:
+            print(f"解析标注文件时出错：{e}")
+            return []
+
+    def _generate_mask(self, img_shape, bboxes):
+        """根据边界框生成二值掩膜"""
+        mask = np.zeros((img_shape[0], img_shape[1]), dtype=np.float32)
+        for (x1, y1, w, h) in bboxes:
+            x2 = min(x1 + w, img_shape[1])
+            y2 = min(y1 + h, img_shape[0])
+            mask[y1:y2, x1:x2] = 1.0
+        return mask
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name, bboxes = self.annotations[idx]
+        img_path = os.path.join(self.image_dir, img_name)
+        
+        # 加载图像并调整尺寸
+        try:
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"警告：无法加载图像 {img_path}")
+                # 返回一个空图像和掩膜
+                image = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+                mask = np.zeros((1, self.img_size, self.img_size), dtype=np.float32)
+                return torch.zeros(3, self.img_size, self.img_size), torch.from_numpy(mask)
+            
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+            image = cv2.resize(image, (self.img_size, self.img_size))
+            
+            # 生成掩膜并调整尺寸
+            mask = self._generate_mask((h, w), bboxes)
+            mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+            mask = mask[np.newaxis, ...]  # 添加通道维度 (1, H, W)
+
+            # 应用数据增强
+            image = self.transform(image)
+            return image, torch.from_numpy(mask)
+        except Exception as e:
+            print(f"处理图像 {img_path} 时出错：{e}")
+            # 返回一个空图像和掩膜
+            image = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            mask = np.zeros((1, self.img_size, self.img_size), dtype=np.float32)
+            return torch.zeros(3, self.img_size, self.img_size), torch.from_numpy(mask)
+
+# ---------------------------
+# 3. 数据加载器
+# ---------------------------
+batch_size = 8
+num_workers = 4
+
+try:
+    print("正在加载训练数据集...")
+    train_dataset = WiderFaceDataset(train_image_dir, train_annot_file, is_train=True, sample_ratio=0.1)  # 只使用1/10的训练数据
+    print("正在加载验证数据集...")
+    val_dataset = WiderFaceDataset(val_image_dir, val_annot_file, is_train=False, sample_ratio=0.1)  # 只使用1/10的验证数据
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # ---------------------------
+    # 4. 模型初始化
+    # ---------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+    # model = U2NET(in_ch=3, out_ch=1).to(device)
+    model = U2NETP(in_ch=3, out_ch=1).to(device)
+
+    # 加载预训练权重
+    try:
+        # pretrained_weights = torch.load("/Users/shhaofu/Downloads/u2net.pth", map_location=device)
+        pretrained_weights = torch.load("/Users/shhaofu/Code/Codes/backgroundremover/models/u2netp.pth", map_location=device)
+        model.load_state_dict(pretrained_weights)
+        print("成功加载预训练权重")
+    except Exception as e:
+        print(f"加载预训练权重时出错：{e}")
+        print("将使用随机初始化的权重继续训练")
+
+    # ---------------------------
+    # 5. 损失函数与优化器
+    # ---------------------------
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+
+    # ---------------------------
+    # 6. 训练循环
+    # ---------------------------
+    best_val_loss = float('inf')
+    num_epochs = 10 # 100
+
+    for epoch in range(num_epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        for i, (images, masks) in enumerate(train_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            optimizer.zero_grad()
+            # U2NET 返回多个输出，我们使用最后一个（最精细的）
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                output = outputs[0]  # 使用主输出
+            else:
+                output = outputs
+                
+            loss = criterion(output, masks)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * images.size(0)
+            
+            # 每10个批次打印一次进度
+            if (i+1) % 2 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+        
+        train_loss /= len(train_loader.dataset)
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+                outputs = model(images)
+                if isinstance(outputs, tuple):
+                    output = outputs[0]  # 使用主输出
+                else:
+                    output = outputs
+                loss = criterion(output, masks)
+                val_loss += loss.item() * images.size(0)
+        
+        val_loss /= len(val_loader.dataset)
+        scheduler.step(val_loss)
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), f"u2net_face_best.pth")
+        
+        # 打印日志
+        print(f"Epoch [{epoch+1}/{num_epochs}] | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+    # 保存最终模型
+    torch.save(model.state_dict(), f"u2net_face_final.pth")
+    print("训练完成，已保存最终模型")
+
+except Exception as e:
+    print(f"训练过程中出错：{e}")
+
+# 人脸检测函数
+def detect_faces(image_path, model_path="u2net_face_best.pth", img_size=512):
+    # 加载模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = U2NET(in_ch=3, out_ch=1).to(device)
+    model = U2NETP(in_ch=3, out_ch=1).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 预处理图像
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w = image.shape[:2]
+    img_input = cv2.resize(image, (img_size, img_size))
+    img_tensor = transforms.ToTensor()(img_input).unsqueeze(0).to(device)
+    img_tensor = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img_tensor)
+
+    # 推理
+    with torch.no_grad():
+        outputs = model(img_tensor)
+        if isinstance(outputs, tuple):
+            mask = outputs[0].squeeze().cpu().numpy()
+        else:
+            mask = outputs.squeeze().cpu().numpy()
+    
+    # 后处理
+    mask = (mask > 0.5).astype(np.uint8) * 255
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    # 提取边界框
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bboxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        bboxes.append((x, y, x+w, y+h))  # 返回 (x1, y1, x2, y2)
+    
+    return bboxes
+
+# 测试代码
+if __name__ == "__main__":
+    # 简单测试数据集加载
+    print("测试数据集加载...")
+    test_dataset = WiderFaceDataset(train_image_dir, train_annot_file, is_train=False, sample_ratio=0.1)  # 只使用1/10的测试数据
+    print(f"数据集大小: {len(test_dataset)}")
+    
+    if len(test_dataset) > 0:
+        # 获取一个样本
+        image, mask = test_dataset[0]
+        print(f"图像形状: {image.shape}, 掩膜形状: {mask.shape}")
+        
+        # 尝试加载模型并进行推理
+        try:
+            image_path = "/Users/shhaofu/Code/cursor-projects/aka_music/backend/app/static/beauty/写真/artistic portrait_1_0.jpg"
+            if os.path.exists(image_path):
+                if os.path.exists("u2net_face_best.pth"):
+                    bboxes = detect_faces(image_path)
+                    print(f"检测到的人脸边界框：{bboxes}")
+                else:
+                    print("模型文件不存在，跳过推理测试")
+            else:
+                print(f"测试图像不存在: {image_path}")
+        except Exception as e:
+            print(f"测试推理时出错：{e}")

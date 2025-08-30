@@ -1,0 +1,17 @@
+1. https://file.qingflow.com/official-page/index/v2021/section2-1-1.png  
+2. https://file.qingflow.com/official-page/index/v2021/section2-3-2.png  
+3. https://file.qingflow.com/official-page/index/customer-case/production-manage.png  
+4. https://file.qingflow.com/official-page/index/customer-case/quality-control.png  
+5. https://file.qingflow.com/official-page/index/customer-case/oa-coworking-platform.png  
+6. https://file.qingflow.com/official-page/index/v2021/section2-1-4.png  
+7. https://file.qingflow.com/official-page/index/customer-case/customer-manage.png  
+8. https://file.qingflow.com/official-page/index/customer-case/internet-management.png  
+9. https://file.qingflow.com/official-page/index/customer-case/project-manage.png  
+10. https://file.qingflow.com/official-page/index/customer-case/invoicing-2.0.png  
+11. https://file.qingflow.com/official-page/index/customer-case/after-manage.png  
+12. https://file.qingflow.com/official-page/index/customer-case/functionality-updates.png  
+13. https://file.qingflow.com/official-page/index/customer-case/asset-management.png  
+14. https://file.qingflow.com/official-page/index/customer-case/process-manage.png  
+15. https://file.qingflow.com/official-page/index/customer-case/plm-product-lifecycle.png  
+16. https://file.qingflow.com/official-page/index/customer-case/okr-manage-2.0.png  
+17. https://file.qingflow.com/official-page/index/customer-case/more.png  

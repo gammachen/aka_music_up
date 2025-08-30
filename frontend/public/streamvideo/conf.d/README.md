@@ -1,0 +1,1 @@
+这里面是配置rtmp-proxy的，使用nginx转发到多台rtmp-nginx中，正确的见：nginx.conf，其他的配置文件可以忽略（有一些是有问题的）
